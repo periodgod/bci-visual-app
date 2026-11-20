@@ -26,8 +26,9 @@ import numpy as np
 
 # 每秒钟接收的数据包数量
 package_per_second = 5
-# 设备实际采样率（项目统一按 250Hz 运行）
-DEVICE_EEG_SAMPLE_RATE = 250
+# ND8 TCP 实际以 1000 Hz 推送数据（每 200 ms、每通道 200 点）。
+# read_latest_eeg_data 会按调用方的 target_freq（项目为 250 Hz）降采样。
+DEVICE_EEG_SAMPLE_RATE = 1000
 # 存储5分钟的数据，计算存储的包数量
 eeg_package_count = package_per_second * 60 * 5  # 脑电图数据包数量
 eog_package_count = package_per_second * 60 * 5  # 眼电图数据包数量
@@ -408,7 +409,7 @@ def tcp_test():
     通过TCP连接获取脑电图数据
     """
     # 创建TCP模式的设备实例
-    nd_device = NdDevice(mode='tcp', com='', tcp_ip='10.186.179.92', tcp_port=8899, host_mac_bytes=None, eeg_sample=DEVICE_EEG_SAMPLE_RATE)
+    nd_device = NdDevice(mode='tcp', com='', tcp_ip='127.0.0.1', tcp_port=8899, host_mac_bytes=None, eeg_sample=DEVICE_EEG_SAMPLE_RATE)
     nd_device.start()  # 启动设备
     
     # 数据质量统计变量

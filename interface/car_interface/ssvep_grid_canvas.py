@@ -1,20 +1,20 @@
 """
-SSVEP 混合编码刺激画布 — Qt 原生渲染
+SSVEP 频率-相位编码刺激画布 — Qt 原生渲染
 =============================================
-40 个闪烁块 (5×8 矩阵)，频率-相位联合编码。
-每个块内含 5 个十字形注视点，共 200 个可区分目标。
+9 个刺激块 (3×3 矩阵)，频率-相位联合编码。
+每个块对应一条小车命令。
 
-渲染方式：正弦调制 L(t) = 0.5×(1 + sin(2π·f·t + φ))
+渲染方式：频谱合成亮度序列。
+先按基频、谐波和相位合成目标频谱，再映射到 0~1 亮度；
+不是简单在界面线程里直接翻转黑白块。
 帧同步通过 QTimer(PreciseTimer) + 屏幕刷新率驱动。
-
-设计参考：高小榕团队 Cyborg and Bionic Systems (2024)
 """
 
 from __future__ import annotations
 
 import math
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF
@@ -59,6 +59,10 @@ class GridConfig:
     FIXATION_COLOR = (220, 60, 60)     # 注视十字 (红)
     CUE_COLOR = (60, 220, 60)          # 提示高亮 (绿)
     FLICKER_HIGH = (255, 255, 255)     # 闪烁峰值 (白)
+
+    # 频谱合成参数：基频 + 谐波。权重越高，视觉刺激越接近该频谱分量。
+    SPECTRUM_HARMONICS = (1, 2, 3)
+    SPECTRUM_WEIGHTS = (1.0, 0.35, 0.18)
 
 
 # 在类外初始化 PHASE_VALUES（避免 Python 类体内列表推导式作用域问题）
@@ -122,20 +126,28 @@ class FlickerBlock:
 # ═══════════════════════════════════════════════════════════════════
 
 class SSVEPGridCanvas(QWidget):
-    """SSVEP 混合编码刺激画布。
+    """SSVEP 频率-相位编码刺激画布。
 
     Parameters
     ----------
     parent : QWidget
-    target_count : 40 或 200
-        40 = 仅频率-相位编码；200 = 频率-相位-空间混合编码。
+    target_count : int
+        当前小车展示页使用 9 个目标。
+    frequencies : Sequence[float] | None
+        每个块的实际刺激频率。传入后画布与解码器使用同一频率表。
     """
 
     # 回调信号可以用 Qt Signal，这里用简单回调保持解耦
     on_stim_started = None   # callable()
     on_stim_stopped = None   # callable()
 
-    def __init__(self, parent=None, target_count: int = 40):
+    def __init__(
+        self,
+        parent=None,
+        target_count: int = 9,
+        frequencies: Optional[Sequence[float]] = None,
+        phases: Optional[Sequence[float]] = None,
+    ):
         super().__init__(parent)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
@@ -149,15 +161,8 @@ class SSVEPGridCanvas(QWidget):
 
         # ── 频率 & 相位 ──
         cfg = GridConfig
-        self._freqs: List[float] = [
-            cfg.FREQ_START + i * cfg.FREQ_STEP
-            for i in range(cfg.N_BLOCKS)
-        ]
-        self._phases: List[float] = []
-        for row in range(cfg.N_ROWS):
-            for col in range(cfg.N_COLS):
-                phase_idx = (row + col) % cfg.N_PHASES
-                self._phases.append(cfg.PHASE_VALUES[phase_idx])
+        self._freqs: List[float] = self._normalize_freqs(frequencies)
+        self._phases: List[float] = self._normalize_phases(phases)
 
         # ── 创建闪烁块 ──
         self._blocks: List[FlickerBlock] = []
@@ -170,6 +175,7 @@ class SSVEPGridCanvas(QWidget):
         self._refresh_hz = _detect_screen_refresh_rate()
         self._frame_interval_ms = max(1, int(1000.0 / self._refresh_hz))
         self._is_flickering = False
+        self._cue_text = ""
         self._t_start: float = 0.0
         self._frame_index: int = 0
         self._last_render_frame: int = -1
@@ -206,6 +212,20 @@ class SSVEPGridCanvas(QWidget):
     def phases(self) -> np.ndarray:
         return np.asarray(self._phases, dtype=float)
 
+    def set_frequencies(self, frequencies: Sequence[float]):
+        """更新刺激频率，并同步到所有块。"""
+        self._freqs = self._normalize_freqs(frequencies)
+        for blk, freq in zip(self._blocks, self._freqs):
+            blk.freq_hz = float(freq)
+        self.update()
+
+    def set_phases(self, phases: Sequence[float]):
+        """更新相位，并同步到所有块。"""
+        self._phases = self._normalize_phases(phases)
+        for blk, phase in zip(self._blocks, self._phases):
+            blk.phase_rad = float(phase)
+        self.update()
+
     def block_freq(self, block_idx: int) -> float:
         return self._freqs[block_idx]
 
@@ -214,6 +234,33 @@ class SSVEPGridCanvas(QWidget):
 
     def global_target_id(self, block_idx: int, fp_idx: int) -> int:
         return block_idx * GridConfig.N_FIXATIONS + fp_idx
+
+    def _normalize_freqs(self, frequencies: Optional[Sequence[float]]) -> List[float]:
+        cfg = GridConfig
+        default_freqs = [
+            cfg.FREQ_START + i * cfg.FREQ_STEP
+            for i in range(cfg.N_BLOCKS)
+        ]
+        if frequencies is None:
+            return [float(x) for x in default_freqs]
+        values = [float(x) for x in frequencies]
+        if len(values) < cfg.N_BLOCKS:
+            values.extend(default_freqs[len(values):])
+        return values[:cfg.N_BLOCKS]
+
+    def _normalize_phases(self, phases: Optional[Sequence[float]]) -> List[float]:
+        cfg = GridConfig
+        default_phases = []
+        for row in range(cfg.N_ROWS):
+            for col in range(cfg.N_COLS):
+                phase_idx = (row + col) % cfg.N_PHASES
+                default_phases.append(cfg.PHASE_VALUES[phase_idx])
+        if phases is None:
+            return [float(x) for x in default_phases]
+        values = [float(x) for x in phases]
+        if len(values) < cfg.N_BLOCKS:
+            values.extend(default_phases[len(values):])
+        return values[:cfg.N_BLOCKS]
 
     # ── 布局计算 ───────────────────────────────────────────────
 
@@ -260,22 +307,22 @@ class SSVEPGridCanvas(QWidget):
             y = start_y + blk.row * (block_size + gap_px)
             blk.rect = QRectF(x, y, block_size, block_size)
 
-            # 注视点位置 (块内偏移)
-            if self._show_fixation_crosses:
-                cx = x + block_size / 2.0
-                cy = y + block_size / 2.0
-                offset = block_size * 0.22  # 注视点偏移 ~22% 块半边长
-                blk.fixation_positions = [
-                    (cx + dx * offset, cy + dy * offset)
-                    for dx, dy in cfg.FIXATION_DIRECTIONS
-                ]
+            # 注视点位置始终计算：小车的 9 目标界面虽然不显示普通十字，
+            # 但训练/测试时仍需要在被提示目标上显示醒目的引导标记。
+            cx = x + block_size / 2.0
+            cy = y + block_size / 2.0
+            offset = block_size * 0.22  # 注视点偏移 ~22% 块半边长
+            blk.fixation_positions = [
+                (cx + dx * offset, cy + dy * offset)
+                for dx, dy in cfg.FIXATION_DIRECTIONS
+            ]
 
         self._layout_done = True
 
     # ── 闪烁控制 ───────────────────────────────────────────────
 
     def start_flicker(self):
-        """开始闪烁。"""
+        """开始频谱合成刺激。"""
         if self._is_flickering:
             return
         self._is_flickering = True
@@ -287,7 +334,7 @@ class SSVEPGridCanvas(QWidget):
             self.on_stim_started()
 
     def stop_flicker(self):
-        """停止闪烁，恢复默认灰色（块仍可见）。"""
+        """停止刺激，恢复默认灰色（块仍可见）。"""
         self._is_flickering = False
         self._stim_timer.stop()
         for blk in self._blocks:
@@ -301,15 +348,23 @@ class SSVEPGridCanvas(QWidget):
         self.stop_flicker()
         for blk in self._blocks:
             blk.cued_fp_idx = -1
+        self._cue_text = ""
 
     # ── 提示控制 ───────────────────────────────────────────────
 
-    def cue_target(self, block_idx: int, fp_idx: int = 0):
+    @property
+    def cue_text(self) -> str:
+        return self._cue_text
+
+    def cue_target(self, block_idx: int, fp_idx: int = 0, text: str = ""):
         """高亮指定目标的注视点（绿色）。传 -1 取消。"""
         for blk in self._blocks:
             blk.cued_fp_idx = -1
         if 0 <= block_idx < GridConfig.N_BLOCKS:
             self._blocks[block_idx].cued_fp_idx = fp_idx
+            self._cue_text = str(text).strip()
+        else:
+            self._cue_text = ""
         self.update()
 
     def clear_cue(self):
@@ -331,11 +386,30 @@ class SSVEPGridCanvas(QWidget):
 
         t_sec = self._frame_index / self._refresh_hz
         for blk in self._blocks:
-            lum = 0.5 * (1.0 + math.sin(
-                2.0 * math.pi * blk.freq_hz * t_sec + blk.phase_rad
-            ))
-            blk.current_lum = float(lum)
+            blk.current_lum = self._synthesize_luminance(
+                blk.freq_hz,
+                blk.phase_rad,
+                t_sec,
+            )
         self.update()
+
+    def _synthesize_luminance(self, freq_hz: float, phase_rad: float, t_sec: float) -> float:
+        """由目标频谱合成单帧亮度。
+
+        基频携带主要 SSVEP 标签；谐波用于增强可识别频谱。相位按谐波阶数同步，
+        保持与 FBCCA/TDCA 参考信号一致。
+        """
+        weights = GridConfig.SPECTRUM_WEIGHTS
+        harmonics = GridConfig.SPECTRUM_HARMONICS
+        total_weight = max(1e-9, float(sum(abs(w) for w in weights)))
+        value = 0.0
+        for harmonic, weight in zip(harmonics, weights):
+            h = float(harmonic)
+            value += float(weight) * math.sin(
+                2.0 * math.pi * h * float(freq_hz) * t_sec + h * float(phase_rad)
+            )
+        value /= total_weight
+        return float(np.clip(0.5 + 0.5 * value, 0.0, 1.0))
 
     def _current_time_sec(self) -> float:
         if self._is_flickering:
@@ -357,6 +431,42 @@ class SSVEPGridCanvas(QWidget):
 
         cfg = GridConfig
 
+        # ── 左侧独立提示框 ──
+        # 训练、测试时把“该看哪里”放在闪烁矩阵外，避免提示被亮度变化淹没。
+        if self._cue_text:
+            valid_rects = [blk.rect for blk in self._blocks if not blk.rect.isEmpty()]
+            left_edge = min((rect.left() for rect in valid_rects), default=float(self.width()))
+            panel_margin = max(18.0, min(self.width(), self.height()) * 0.035)
+            panel_w = min(330.0, max(150.0, left_edge - panel_margin * 2))
+            panel_h = min(230.0, max(140.0, self.height() * 0.28))
+            panel_x = panel_margin
+            panel_y = (self.height() - panel_h) / 2.0
+            panel = QRectF(panel_x, panel_y, panel_w, panel_h)
+
+            painter.setPen(QPen(QColor(62, 220, 110), 3.0))
+            painter.setBrush(QBrush(QColor(8, 28, 22, 235)))
+            painter.drawRoundedRect(panel, 18, 18)
+
+            title_font = QFont("Microsoft YaHei", max(12, int(panel_w * 0.075)))
+            title_font.setBold(True)
+            painter.setFont(title_font)
+            painter.setPen(QColor(142, 255, 180))
+            painter.drawText(
+                QRectF(panel_x + 12, panel_y + 18, panel_w - 24, panel_h * 0.30),
+                Qt.AlignHCenter | Qt.AlignVCenter,
+                "请注视",
+            )
+
+            cue_font = QFont("Microsoft YaHei", max(16, int(panel_w * 0.13)))
+            cue_font.setBold(True)
+            painter.setFont(cue_font)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(
+                QRectF(panel_x + 10, panel_y + panel_h * 0.35, panel_w - 20, panel_h * 0.48),
+                Qt.AlignHCenter | Qt.AlignVCenter | Qt.TextWordWrap,
+                self._cue_text,
+            )
+
         for blk in self._blocks:
             rect = blk.rect
             if rect.isEmpty():
@@ -377,28 +487,42 @@ class SSVEPGridCanvas(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
 
-            # ── 注视十字 ──
-            if self._show_fixation_crosses and blk.fixation_positions:
-                cross_len = max(2.0, rect.width() * 0.06)
-                cross_w = max(1.0, cross_len * 0.22)
-
+            # ── 注视十字 / 当前目标提示 ──
+            # 小车界面只有 9 个目标，普通注视十字默认隐藏，但当前提示必须始终可见。
+            if blk.fixation_positions:
                 for fp_idx, (fx, fy) in enumerate(blk.fixation_positions):
-                    # 提示高亮颜色
                     is_cued = (blk.cued_fp_idx == fp_idx)
-                    cross_color = QColor(*cfg.CUE_COLOR) if is_cued else QColor(*cfg.FIXATION_COLOR)
+                    if not self._show_fixation_crosses and not is_cued:
+                        continue
 
-                    painter.setPen(Qt.NoPen)
-                    painter.setBrush(QBrush(cross_color))
-                    # 水平臂
-                    painter.drawRect(QRectF(
-                        fx - cross_len / 2, fy - cross_w / 2,
-                        cross_len, cross_w,
-                    ))
-                    # 垂直臂
-                    painter.drawRect(QRectF(
-                        fx - cross_w / 2, fy - cross_len / 2,
-                        cross_w, cross_len,
-                    ))
+                    if is_cued:
+                        cross_len = max(24.0, min(rect.width(), rect.height()) * 0.34)
+                        cross_w = max(5.0, cross_len * 0.16)
+                        ring_size = max(38.0, cross_len * 1.45)
+
+                        # 黑色外描边保证提示在明暗闪烁背景上都清晰。
+                        painter.setBrush(Qt.NoBrush)
+                        painter.setPen(QPen(QColor(0, 0, 0), max(7.0, cross_w * 1.8)))
+                        painter.drawEllipse(QRectF(
+                            fx - ring_size / 2, fy - ring_size / 2,
+                            ring_size, ring_size,
+                        ))
+                        painter.setPen(QPen(QColor(*cfg.CUE_COLOR), max(4.0, cross_w)))
+                        painter.drawEllipse(QRectF(
+                            fx - ring_size / 2, fy - ring_size / 2,
+                            ring_size, ring_size,
+                        ))
+                    else:
+                        cross_len = max(2.0, rect.width() * 0.06)
+                        cross_w = max(1.0, cross_len * 0.22)
+
+                    cross_color = QColor(*cfg.CUE_COLOR) if is_cued else QColor(*cfg.FIXATION_COLOR)
+                    painter.setPen(QPen(QColor(0, 0, 0), max(2.0, cross_w * 1.8)))
+                    painter.drawLine(QPointF(fx - cross_len / 2, fy), QPointF(fx + cross_len / 2, fy))
+                    painter.drawLine(QPointF(fx, fy - cross_len / 2), QPointF(fx, fy + cross_len / 2))
+                    painter.setPen(QPen(cross_color, cross_w))
+                    painter.drawLine(QPointF(fx - cross_len / 2, fy), QPointF(fx + cross_len / 2, fy))
+                    painter.drawLine(QPointF(fx, fy - cross_len / 2), QPointF(fx, fy + cross_len / 2))
 
         painter.end()
 
@@ -440,7 +564,7 @@ if __name__ == "__main__":
     layout = QVBoxLayout(win)
     layout.setContentsMargins(0, 0, 0, 0)
 
-    canvas = SSVEPGridCanvas(target_count=40)
+    canvas = SSVEPGridCanvas(target_count=9)
     layout.addWidget(canvas)
 
     # 按空格开始/暂停
@@ -455,7 +579,7 @@ if __name__ == "__main__":
         elif e.key() == Qt.Key_C:
             # 随机提示一个目标
             import random
-            bid = random.randint(0, 39)
+            bid = random.randint(0, GridConfig.N_BLOCKS - 1)
             fid = random.randint(0, 4) if canvas._show_fixation_crosses else 0
             canvas.cue_target(bid, fid)
             print(f"[CUE] Block {bid+1}, FP {fid+1}")

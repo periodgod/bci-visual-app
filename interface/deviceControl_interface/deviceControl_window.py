@@ -183,7 +183,9 @@ class DeviceControlWindow(QWidget):
         self.tcp_ip_label = BodyLabel()
         self.tcp_ip_label.setText('TCP IP')
         self.tcp_ip_edit = LineEdit()
-        self.tcp_ip_edit.setText('10.186.179.92')
+        # NeuroAI/ND8 is running on this computer.  Use loopback so the
+        # connection keeps working if the Wi-Fi address changes.
+        self.tcp_ip_edit.setText('127.0.0.1')
         self.tcp_ip_edit.setFixedWidth(150)
         self.tcp_layout.addWidget(self.tcp_ip_label)
         self.tcp_layout.addWidget(self.tcp_ip_edit)

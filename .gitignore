@@ -1,36 +1,44 @@
-# Data
-saveCarData/
-*.mat
-*.npy
-*.npz
-*.zip
-*.whl
-*.dat
-*.dll
-*.pth
-*.pt
-*.ipynb
-
-# Cache & IDE
+# Python / Qt runtime
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and IDE files
+.conda/
 .venv/
-.claude/
+venv/
+env/
 .idea/
 .vscode/
-*.swp
 
-# Logs & output
+# Logs, generated runtime data, and subject recordings
 logs/
-runtime_data/
-*.log
-*.txt
-!requirements*.txt
+saveCarData/
+user/
+memories/session/
+test.mat
+dist/
+environment/*.lock.yml
+environment/*.lock.txt
 
-# Misc
-165hz/
-install_robot_ssh_key.bat
-upload_code.bat
-setup_env.bat
-setup_env.ps1
-signal_preprocess.m
+# Generated presentation/image exports
+ppt_result_export/
+ppt_template_export/
+ppt_v2_preview/
+ppt_v4_preview/
+ppt_v4_preview_fix/
+
+# Local scratch / benchmark scripts
+_tmp_*.py
+all_files.txt
+
+# Binary installers / wheels
+*.whl
+
+# OS noise
+Thumbs.db
+.DS_Store
